@@ -29,4 +29,4 @@ OVERLAY_MODEL=yolo11s-seg.onnx python overlay.py run1.mp4 run2.mp4 out.mp4 --off
 
 ## Contact
 
-Inflection Code Project, operated by Inflection Advisory AS (Norway). Write @ICP in the Ask tab on racinghill.com.
+Inflection Code Project, operated by Inflection Advisory AS (Norway). Email: jorgen@inflection.no
