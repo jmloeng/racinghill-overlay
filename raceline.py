@@ -24,6 +24,8 @@ from overlay import (OverlayError, Reader, prep_gray, flow_h, h_sane, track_pos,
 from seg import SIZE, letterbox
 
 SMOOTH = 3            # frames each side for foot smoothing
+LINE_SMOOTH_S = float(os.environ.get("RACELINE_SMOOTH_S") or 0.4)  # drawn line averaged over this much time (0 = off); ends stay put
+GLOW = float(os.environ.get("RACELINE_GLOW") or 0.45)              # soft coloured glow round the line (0 = off)
 GAP_S = 0.35          # missing racer longer than this = break in the line
 SIFT_EVERY = int(os.environ.get("RACELINE_SIFT_EVERY") or 2)  # keyframe match every n-th frame (optical flow in between)
 RED = (29, 0, 232)    # BGR, Racinghill red (video 1 / the single video)
@@ -350,26 +352,57 @@ class Line:
             pieces.append(cur)
         return [np.round(np.float64(c) * 4).astype(np.int32).reshape(-1, 1, 2) for c in pieces if len(c) >= 2]
 
+    @staticmethod
+    def smoothed(seg, h):
+        """seg's points averaged over h points each side (Gaussian), the window shrinking towards both ends so the line
+        still starts and ends exactly where the racer was (no lag behind the feet, no corners cut at the ends)"""
+        P = np.float64([q[:2] for q in seg])
+        n = len(P)
+        if h < 1 or n < 3:
+            return [[x, y, q[2]] for (x, y), q in zip(P, seg)]
+        out = np.empty_like(P)
+        for k in range(n):
+            r = min(h, k, n - 1 - k)
+            w = np.exp(-0.5 * (np.arange(-r, r + 1) / max(1.0, h / 2)) ** 2)
+            out[k] = (P[k - r:k + r + 1] * w[:, None]).sum(0) / w.sum()
+        return [[x, y, q[2]] for (x, y), q in zip(out, seg)]
+
     def draw(self, frame, color, th, M):
         """M: this video's frame coords -> frame's coords"""
         fps, i, tail = self.fps, self.i, self.tail
         lim = 1.5 * max(frame.shape[:2])
         buckets = [(0, 1e9, 1.0)] if not tail else [(0, 0.5 * tail, 1.0), (0.5 * tail, 0.75 * tail, 0.6), (0.75 * tail, tail + 1, 0.3)]
-        any_drawn = False
+        h = int(round(LINE_SMOOTH_S * fps / 2))
+        segs = [self.smoothed(seg, h) for seg in self.segs if len(seg) >= 0.5 * fps]  # pieces shorter than 0.5 s: usually someone who isn't the racer
+        pieces = []
         for lo, hi, alpha in buckets:
-            layer = frame.copy() if alpha < 1 else frame
-            drawn = False
-            for seg in self.segs:
+            ps = []
+            for seg in segs:
                 part = [q for q in seg if lo * fps <= i - q[2] <= hi * fps + 1]
-                if len(part) < 2 or len(seg) < 0.5 * fps:     # pieces shorter than 0.5 s: usually someone who isn't the racer
-                    continue
-                for p in self.project(part, M, frame.shape):
-                    cv2.polylines(layer, [p], False, WHITE, th + 4, cv2.LINE_AA, shift=2)
-                    cv2.polylines(layer, [p], False, color, th, cv2.LINE_AA, shift=2)
-                    drawn = True
-            if drawn and alpha < 1:
+                if len(part) >= 2:
+                    ps += self.project(part, M, frame.shape)
+            if ps:
+                pieces.append((ps, alpha))
+        edge = 4
+        if pieces and GLOW > 0:
+            th, edge = max(2, round(0.7 * th)), 2     # with the glow a thinner line with a thin white edge looks cleaner
+            # glow: the line's colour blended into the picture round it (additive light would vanish on white snow)
+            s = 4
+            small = np.zeros((frame.shape[0] // s, frame.shape[1] // s), np.float32)
+            for ps, alpha in pieces:
+                cv2.polylines(small, [p // s for p in ps], False, alpha, max(1, (2 * th) // s), cv2.LINE_AA, shift=2)
+            k = max(3, (3 * th) // s) | 1
+            small = cv2.GaussianBlur(small, (k, k), 0)
+            a = cv2.resize(small, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)[..., None] * GLOW
+            frame[:] = (frame * (1 - a) + np.float32(color) * a).astype(np.uint8)
+        for ps, alpha in pieces:
+            layer = frame.copy() if alpha < 1 else frame
+            for p in ps:
+                cv2.polylines(layer, [p], False, WHITE, th + edge, cv2.LINE_AA, shift=2)
+                cv2.polylines(layer, [p], False, color, th, cv2.LINE_AA, shift=2)
+            if alpha < 1:
                 cv2.addWeighted(layer, alpha, frame, 1 - alpha, 0, dst=frame)
-            any_drawn |= drawn
+        any_drawn = bool(pieces)
         if self.foot is not None:
             x, y = apply(M, self.foot)
             if np.isfinite(x) and np.isfinite(y) and abs(x) < lim and abs(y) < lim:
@@ -377,6 +410,68 @@ class Line:
                 cv2.circle(frame, (int(x), int(y)), th + 1, color, -1, cv2.LINE_AA)
         self.drawn += any_drawn
         return any_drawn
+
+
+class Delta:
+    """Time gap between video 1's racer and the ghost at the same spot on the course, counted from the locked moment
+    (the fixed point where both were lined up, gap 0). + = video 1 is behind.
+    Followed step by step: j = the ghost's frame that matches video 1's racer now, i.e. the ghost's foot point closest
+    to video 1's racer. j never goes back, may stay at most 2 frames and goes forward at most 0.5 s per frame, with
+    a small pull towards an unchanged gap, so the zig-zag of the line crossing itself in the picture can't make it jump;
+    after 0.3 s without a match it looks within 2 s. Only points where the ghost moves count (not people standing).
+    The ghost's whole analysed path is known in advance, so it also works while video 1 is ahead. No match: j moves on
+    with the clock (gap unchanged)."""
+
+    def __init__(self, an_a, an_b, fps):
+        self.fps, self.feetA, self.feetB = fps, an_a["feet"], an_b["feet"]
+        speed = moving(an_b["Hs"], an_b["feet"], an_b["boxes"], fps)
+        self.okB = [f is not None and v is not None and v >= 0.5 for f, v in zip(an_b["feet"], speed)]
+        G = [np.eye(3)]                         # ghost frame 0 -> frame j
+        for Hk in an_b["Hs"][1:]:
+            G.append(Hk @ G[-1])
+        self.G = G
+        self.j = 0.0
+        self.miss = self.same = 0
+        self.vals = []                          # (frame, gap s)
+        self.shown = None
+
+    def step(self, k, MA, MB, h):
+        """MA / MB: video 1 / ghost frame coords -> output coords (MB None while the two aren't lined up)"""
+        fa = self.feetA[k] if k < len(self.feetA) else None
+        jp = int(round(self.j))
+        best = None
+        if MB is not None and fa is not None and k < len(self.G):
+            pa = np.float64(apply(MA, fa))
+            Gk = self.G[k]
+            wide = self.miss > 0.3 * self.fps
+            lo, hi = (jp - int(2 * self.fps), jp + int(2 * self.fps)) if wide else (jp, jp + 1 + int(0.5 * self.fps))
+            for j in range(max(0, lo), min(len(self.feetB), hi + 1)):
+                if not self.okB[j]:
+                    continue
+                pb = apply(MB @ Gk @ np.linalg.inv(self.G[j]), self.feetB[j])   # ghost's foot at frame j, as seen now
+                d = float(np.hypot(pb[0] - pa[0], pb[1] - pa[1]))
+                c = d + 0.004 * h * abs(j - jp - 1)       # small pull towards "gap unchanged"
+                if best is None or c < best[2]:
+                    best = (d, j, c)
+            if best is not None and best[0] >= (0.06 if wide else 0.12) * h:
+                best = None
+        if best is not None and best[1] == jp:
+            self.same += 1
+            if self.same > 2:                   # stuck on one ghost frame while video 1 moves on: not a real match
+                best = None
+        else:
+            self.same = 0
+        if best is not None:
+            self.j, self.miss = float(best[1]), 0
+        else:
+            self.j += 1.0
+            self.miss += 1
+        if k >= 0.5 * self.fps:                 # a moment to settle after the lock
+            self.vals.append((k, (k - self.j) / self.fps))
+        self.vals = [v for v in self.vals if k - v[0] <= 0.4 * self.fps]
+        if len(self.vals) >= 3:
+            self.shown = float(np.median([v[1] for v in self.vals]))
+        return self.shown
 
 
 def line_for(a):

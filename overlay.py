@@ -339,7 +339,7 @@ def render(a_path, b_path, out_path, *, offset_s, start_a, track_a=None, track_b
     p_render = (lambda p: progress(p)) if progress else None
     lineA = lineB = an_a = an_b = None
     if lines:
-        from raceline import analyse, line_for
+        from raceline import analyse, line_for, Delta
         parts = [0.0, 0.0]
 
         def prog(n):
@@ -353,6 +353,7 @@ def render(a_path, b_path, out_path, *, offset_s, start_a, track_a=None, track_b
             fb_ = ex.submit(analyse, b_path, start_b, step / fps_in, total, seg, track_b, prog(1), log)
             an_a, an_b = fa_.result(), fb_.result()
         lineA, lineB = line_for(an_a), line_for(an_b)
+        delta = Delta(an_a, an_b, fps)
         log(f"race lines: racer found A {an_a['found']}/{total}, B {an_b['found']}/{total}, tail A {lineA.tail} B {lineB.tail}, analysis {time.time() - T0:.0f}s")
         if progress:
             p_render = lambda p: progress(0.5 + 0.5 * p)  # noqa: E731
@@ -416,6 +417,7 @@ def render(a_path, b_path, out_path, *, offset_s, start_a, track_a=None, track_b
     last_box_B = None             # racer box in B (full px), hides the racer from matching when there is no track
     featsB = None
     status = ""
+    gap, gap_labs = None, {}      # race lines on: time gap at the same spot (raceline.Delta), labels by text
 
     def segment(fb, tb):
         """racer mask in B: (mask crop, x0, y0, box_full) or None"""
@@ -549,6 +551,8 @@ def render(a_path, b_path, out_path, *, offset_s, start_a, track_a=None, track_b
                 if H is not None:
                     lineB.draw(frame, BLUE_LINE, th_line, to_out_from_Awork @ H @ from_Bfull_to_Bwork)
                 lineA.draw(frame, RED_LINE, th_line, scale_mat(so))
+                gap = delta.step(k, scale_mat(so),
+                                 (to_out_from_Awork @ H @ from_Bfull_to_Bwork) if H is not None else None, oH)
             if H is not None and seg_res is not None:
                 m, x0, y0, bx = seg_res
                 Hf = to_out_from_Awork @ H @ from_Bfull_to_Bwork            # B full px → output px
@@ -583,6 +587,14 @@ def render(a_path, b_path, out_path, *, offset_s, start_a, track_a=None, track_b
                         edge_arrow(frame, cx, cy, ui)
             paste(frame, lab_a, int(40 * ui), int(40 * ui))
             paste(frame, lab_b, int(40 * ui), lab_y2)
+            if gap is not None:
+                # TV-style gap box under the clock: video 1 vs the ghost at the same spot, green = video 1 ahead
+                txt = f"{'+' if gap >= 0.005 else '−' if gap <= -0.005 else '±'}{abs(gap):.2f}"
+                if txt not in gap_labs:
+                    gap_labs[txt] = label_image(txt, int(54 * ui), (232, 0, 29) if gap >= 0.005 else (0, 200, 90) if gap <= -0.005 else (255, 255, 255))
+                lab = gap_labs[txt]
+                paste(frame, lab, oW - lab[0].shape[1] - int(40 * ui), int(100 * ui))
+                st["gap"] = round(gap, 2)
             t_rel = k / fps
             cv2.putText(frame, f"{t_rel:5.2f}s", (oW - int(200 * ui), int(80 * ui)), cv2.FONT_HERSHEY_DUPLEX, 1.1 * ui,
                         (0, 0, 0), max(3, int(5 * ui)), cv2.LINE_AA)
@@ -621,7 +633,7 @@ def render(a_path, b_path, out_path, *, offset_s, start_a, track_a=None, track_b
     }
     if lineA is not None:
         stats.update(lines=True, line_a_pct=round(100 * lineA.drawn / n, 1), line_b_pct=round(100 * lineB.drawn / n, 1),
-                     tail=[lineA.tail, lineB.tail])
+                     tail=[lineA.tail, lineB.tail], gap_s=st.get("gap"))
     if st["frames"] < fps:
         raise OverlayError("The overlay would be shorter than one second.")
     if st["direct"] < 0.2 * with_b:
