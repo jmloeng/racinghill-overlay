@@ -278,8 +278,11 @@ def edge_arrow(frame, cx, cy, scale):
 
 # ───────────────────────── same spot? ─────────────────────────
 
-SAME_SPOT_ERROR = ("These two runs don't look like they were filmed from the same spot, so they can't be lined up. "
-                   "Pick a run filmed from the same camera position.")
+# Also hits same-spot runs with too little background to match (fog, flat light, a tight zoom following the racer:
+# Hintertux 04.11, Morten/Birk + Karoline/William), so the message names those causes too.
+SAME_SPOT_ERROR = ("These two runs can't be lined up: too little of the background matches between them. "
+                   "That happens when they were filmed from different spots, in fog or flat light, or zoomed in "
+                   "tight on the racer. Wider shots with terrain, lifts or trees in view work best.")
 
 
 def check_same_spot(a_path, b_path, start_a, start_b, seconds, log=print):
