@@ -207,6 +207,7 @@ def analyse(path, t0, step_s, total, seg, track=None, progress=None, log=print, 
         hist.append((i, [(ft, h) for _, ft, h, _ in cands]))
         best, bscore = None, 1e9
         lost = []                 # pull: candidates refused only for being far from the one followed
+        last_tp = np.hypot(last[0] / W - tp[0], last[1] / Hh - tp[1]) if (pull and tp is not None and last is not None) else 9.0
         for d, ft, h, mv in cands:
             score = -d[3]
             if mv is not None and mv < 0.15:
@@ -221,8 +222,8 @@ def analyse(path, t0, step_s, total, seg, track=None, progress=None, log=print, 
                 # far from the one followed: only taken when it is where the racer surely is — or, while the one
                 # followed has drifted away from there (a bystander, seen on Hintertux 0225), anyone closer to it
                 if dist > max(120, 2.5 * (last_h or h)) and not (near_tp is not None and (near_tp < PULL_NEAR or (drift and near_tp < PULL_FAR))):
-                    if pull and not (mv is not None and mv < 0.15) and h >= 0.6 * (last_h or h):   # not someone smaller
-                        lost.append((score, (d, ft, h)))
+                    if pull and not (mv is not None and mv < 0.15) and h >= 0.6 * (last_h or h) and                             (near_tp is None or near_tp < last_tp + 0.05):   # not someone smaller, nor further from the gate
+                        lost.append((score, (d, ft, h)))     # (beta IMG_5815: a skier far below while the racer hid)
                     continue
                 if pull and last_h and h < 0.5 * last_h and dist > last_h:
                     continue          # someone much smaller, well away: not the racer we follow (0225 finish)

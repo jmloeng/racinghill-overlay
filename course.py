@@ -40,6 +40,7 @@ MATCH_WORK = 960       # px (long side) for that comparison
 MIN_INLIERS = 30       # fewer matching points than this = gate not seen in that video
 MAX_WIN_S = 4.0        # crossing search at most this far from the matched moment
 PAD_S = 1.0
+REF_WIN_S = 2.0      # reference video: the crossing within this of the coach's pause at the gate
 
 
 # ───────────────────────── pole feet from one tap ─────────────────────────
@@ -105,14 +106,35 @@ def _features(roi, sc):
     return np.clip(np.maximum(ts, bv), 0, 255).astype(np.uint8), S, bv
 
 
-def _panel(S, tx, ty, sc):
+def _sky(roi, S, sc):
+    """Blue sky is as coloured as a panel and swallows panels at the horizon (upright phone videos of a far-away
+    course): the big coloured area touching the top of the search box, and every pixel of the same colour, is sky."""
     m = (S > 70).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, 8)
+    H, W = S.shape
+    big = [i for i in range(1, n) if st[i][1] == 0 and st[i][4] > 0.08 * H * W]
+    if not big:
+        return None
+    lab_img = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+    sky = np.zeros((H, W), bool)
+    for i in big:
+        sel = lab_img[lab == i]
+        c = np.median(sel, axis=0)
+        spread = np.percentile(np.linalg.norm(sel - c, axis=1), 90)
+        sky |= np.linalg.norm(lab_img - c, axis=2) < max(14.0, 1.3 * spread)
+    return sky
+
+
+def _panel(S, tx, ty, sc, sky=None):
+    m = (S > 70).astype(np.uint8)
+    if sky is not None:
+        m[sky] = 0
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((max(3, int(5 * sc)),) * 2, np.uint8))   # thin poles gone
     n, lab, st, _ = cv2.connectedComponentsWithStats(m, 8)
     best = None
     for i in range(1, n):
         x, y, w, h, area = st[i]
-        if area < 250 * sc * sc or w < 18 * sc or h < 10 * sc or area / (w * h) < 0.35:
+        if area < 160 * sc * sc or w < 12 * sc or h < 8 * sc or area / (w * h) < 0.35 or w > 220 * sc or h > 220 * sc:
             continue
         dx = max(x - tx, 0, tx - (x + w))
         dy = max(y - ty, 0, ty - (y + h))
@@ -124,22 +146,22 @@ def _panel(S, tx, ty, sc):
     return lab == best[1], best[2]
 
 
-def find_feet(frame, tap, _again=True):
+def _feet_panel(frame, tap, _again=True):
     """frame (a clean plate is best), tap px anywhere on the gate → ([(xa, ya), (xb, yb)] left/right pole foot px,
     sure) or (None, False). GS-style gates: a panel between two poles."""
     H, W = frame.shape[:2]
-    sc = H / 1080
+    sc = min(H, W) / 1080          # short side: an upright 1080x1920 phone video is "1080p" too
     R = int(230 * sc)
     x0, y0 = max(int(tap[0]) - R, 0), max(int(tap[1]) - int(1.3 * R), 0)
     x1, y1 = min(int(tap[0]) + R, W), min(int(tap[1]) + R, H)
     roi = frame[y0:y1, x0:x1]
     F, S, BV = _features(roi, sc)
-    pan = _panel(S, tap[0] - x0, tap[1] - y0, sc)
+    pan = _panel(S, tap[0] - x0, tap[1] - y0, sc, _sky(roi, S, sc))
     if pan is None:
         return None, False
     pm, (px, py, pw, ph) = pan
     if _again:        # the same answer wherever on the gate the coach tapped: look again centred on the panel
-        return find_feet(frame, (px + pw / 2 + x0, py + ph / 2 + y0), False)
+        return _feet_panel(frame, (px + pw / 2 + x0, py + ph / 2 + y0), False)
     rows = np.flatnonzero(pm.any(1))
     r0, r1 = rows.min(), rows.max()
     edges = []
@@ -204,6 +226,103 @@ def find_feet(frame, tap, _again=True):
     return [(float(lx), float(ly)), (float(rx), float(ry))], sure
 
 
+def _walk_down(fit, y, F, S, BV, sc):
+    """Follow a pole (x = fit(y)) down from y to where it meets the snow: coloured or darker than the snow."""
+    last, miss = y, 0
+    while y + 1 < F.shape[0] and miss <= 3 * sc + 2:
+        y += 1
+        x = int(round(_x_at(fit, y)))
+        if not (1 <= x < F.shape[1] - 1):
+            break
+        yi = int(y)
+        if S[yi, x - 1:x + 2].max() > 55 or BV[yi, x - 1:x + 2].max() > 28:
+            last, miss = y, 0
+        else:
+            miss += 1
+    return last
+
+
+def _feet_poles(frame, tap):
+    """No panel found (white panels, blue panels against blue sky, shadow on the snow): look for the gate's two poles
+    directly — a pair of thin, nearly upright, similar lines with the tap between them (on the panel or at the feet)."""
+    H, W = frame.shape[:2]
+    sc = min(H, W) / 1080
+    R = int(230 * sc)
+    x0, y0 = max(int(tap[0]) - R, 0), max(int(tap[1]) - int(1.3 * R), 0)
+    x1, y1 = min(int(tap[0]) + R, W), min(int(tap[1]) + R, H)
+    roi = frame[y0:y1, x0:x1]
+    F, S, BV = _features(roi, sc)
+    tx, ty = tap[0] - x0, tap[1] - y0
+    B = (F > 16).astype(np.uint8) * 255
+    segs = cv2.HoughLinesP(B, 1, np.pi / 360, threshold=int(12 * sc) + 4, minLineLength=int(14 * sc) + 4,
+                           maxLineGap=int(5 * sc) + 2)
+    if segs is None:
+        return None, False
+    # join the pieces of one pole: same line (x at two heights within a few px)
+    poles = []
+    for x_1, y_1, x_2, y_2 in segs.reshape(-1, 4).astype(float):
+        if y_2 < y_1:
+            x_1, y_1, x_2, y_2 = x_2, y_2, x_1, y_1
+        if y_2 - y_1 <= 0 or abs(x_2 - x_1) > 0.58 * (y_2 - y_1):        # within 30° of upright
+            continue
+        fit = np.polyfit([y_1, y_2], [x_1, x_2], 1)
+        for pl in poles:
+            if all(abs(_x_at(pl["fit"], yy) - _x_at(fit, yy)) < 3 * sc + 2 for yy in (y_1, y_2)) and \
+                    y_1 < pl["y1"] + 25 * sc and y_2 > pl["y0"] - 25 * sc:
+                pl["pts"] += [(x_1, y_1), (x_2, y_2)]
+                pl["y0"], pl["y1"] = min(pl["y0"], y_1), max(pl["y1"], y_2)
+                q = np.array(pl["pts"])
+                pl["fit"] = np.polyfit(q[:, 1], q[:, 0], 1)
+                break
+        else:
+            poles.append({"fit": fit, "y0": y_1, "y1": y_2, "pts": [(x_1, y_1), (x_2, y_2)]})
+    poles = [p for p in poles if p["y1"] - p["y0"] >= 22 * sc]
+    for p in poles:
+        p["foot"] = _walk_down(p["fit"], p["y1"], F, S, BV, sc)
+        p["xm"] = _x_at(p["fit"], (p["y0"] + p["foot"]) / 2)
+    best = None
+    for L in poles:
+        for Rp in poles:
+            if Rp is L or Rp["xm"] <= L["xm"]:
+                continue
+            gap = np.hypot(_x_at(Rp["fit"], Rp["foot"]) - _x_at(L["fit"], L["foot"]), Rp["foot"] - L["foot"])
+            hl, hr = L["foot"] - L["y0"], Rp["foot"] - Rp["y0"]
+            if not (14 * sc <= gap <= 260 * sc) or abs(L["fit"][0] - Rp["fit"][0]) > 0.6:          # poles often splay
+                continue
+            if abs(L["foot"] - Rp["foot"]) > 0.8 * gap or max(hl, hr) / max(min(hl, hr), 1) > 2.5 or min(hl, hr) < 0.5 * gap:
+                continue
+            top = max(L["y0"], Rp["y0"])
+            if min(L["foot"], Rp["foot"]) - top < 0.4 * min(hl, hr):                   # side by side, not one above
+                continue
+            # how far the tap is from the gate (the area between the poles, from the top down to the feet + a bit)
+            yb = max(L["foot"], Rp["foot"]) + 0.25 * gap
+            xl, xr = _x_at(L["fit"], ty), _x_at(Rp["fit"], ty)
+            dx = max(xl - tx, 0, tx - xr)
+            dy = max(top - ty, 0, ty - yb)
+            d = np.hypot(dx, dy) + 0.02 * gap + 0.3 * abs(L["foot"] - Rp["foot"])     # tie: feet level, smaller gate
+            if best is None or d < best[0]:
+                best = (d, L, Rp, gap)
+    if best is None or best[0] > 45 * sc:
+        return None, False
+    d, L, Rp, gap = best
+    diff = abs(L["foot"] - Rp["foot"])
+    sure = bool(d < 10 * sc + 0.02 * gap + 0.3 * diff and diff < 0.25 * gap)
+    if diff > 0.25 * gap:      # one pole faded out above the snow: carry it on along its own line to the other's foot
+        lo = max(L["foot"], Rp["foot"])
+        L, Rp = [dict(p, foot=lo) if p["foot"] < lo else p for p in (L, Rp)]
+    feet = [(_x_at(L["fit"], L["foot"]) + x0, float(L["foot"]) + y0), (_x_at(Rp["fit"], Rp["foot"]) + x0, float(Rp["foot"]) + y0)]
+    return feet, sure
+
+
+def find_feet(frame, tap):
+    """frame (a clean plate is best), tap px anywhere on the gate → ([(xa, ya), (xb, yb)] left/right pole foot px,
+    sure) or (None, False). The panel first (coloured GS panels), else the pair of poles around the tap."""
+    feet, sure = _feet_panel(frame, tap)
+    if feet is not None:
+        return feet, sure
+    return _feet_poles(frame, tap)
+
+
 def feet_at(path, t, tap, frames=None):
     """Pole feet for a tap (px) in the frame at t of the video: (feet, sure, frame used)."""
     if frames is None:
@@ -242,7 +361,11 @@ def ref_gates(path, gates, log=print):
             auto = True
             log(f"course: {g['label']} gate at {t:.2f}s tap {tap[0]:.0f},{tap[1]:.0f} -> feet {feet} sure {sure} ({used} frames)")
             if feet is None:
-                raise OverlayError(f"Couldn't find the poles of the {g['label']} gate. Tap on the gate's panel, or drag the two pole feet into place.")
+                # a guess the coach can drag into place (••• → Adjust course gates, orange = not sure): a level line
+                # one pole gap wide at the tap — better than no course at all (beta 07.11: the whole course failed)
+                half = 28 * min(W, H) / 1080
+                feet, sure = [(tap[0] - half, tap[1]), (tap[0] + half, tap[1])], False
+                log(f"course: {g['label']} gate: poles not found, level guess at the tap")
         out.append({"label": g["label"], "t": t, "a": [feet[0][0] / W, feet[0][1] / H], "b": [feet[1][0] / W, feet[1][1] / H],
                     "sure": sure, "auto": auto, "_frame": frames[t]})
     return out
@@ -320,11 +443,14 @@ def locate(path, refs, log=print):
         refined = False
         if round(g["t"], 4) in sub:
             pl, _ = plate(sub, round(g["t"], 4), (mid[0], mid[1] - 0.9 * gap))
-            feet, sure = find_feet(pl, (mid[0], mid[1] - 0.9 * gap))
+            tap = (mid[0], mid[1] - 0.9 * gap)
+            # panel method only: the pole-pair search (no panel found) moved good carried feet on Hintertux 0230
+            feet, sure = _feet_panel(pl, tap)
+            near = 0.6
             if feet is not None:
                 dev = max(np.hypot(*(np.array(feet[0]) - A)), np.hypot(*(np.array(feet[1]) - B)))
                 g2 = np.hypot(*(np.array(feet[1]) - np.array(feet[0])))
-                if dev < 0.6 * max(gap, g2) and 0.6 < g2 / max(gap, 1) < 1.6:
+                if dev < near * max(gap, g2) and 0.6 < g2 / max(gap, 1) < 1.6:
                     A, B, refined = np.array(feet[0]), np.array(feet[1]), True
         out.append({"label": g["label"], "t": g["t"], "a": [A[0] / W, A[1] / H], "b": [B[0] / W, B[1] / H],
                     "inl": g["inl"], "refined": refined})
@@ -399,10 +525,14 @@ def _trusted(found, ref_times):
     return best
 
 
-def run_video(path, gates, seg, *, track=None, ref_times=None, discipline="", log=print, progress=None, analysis=None):
+def run_video(path, gates, seg, *, track=None, ref_times=None, discipline="", log=print, progress=None, analysis=None,
+              is_ref=False):
     """gates [{label, t, a, b}] for THIS video (reference gates, or locate()'s result) → result for videos.course.
     ref_times {label: t} = the reference run's crossing times: a gate whose time doesn't fit the others is looked for
-    again around the moment the others say (Hintertux 0230: a start-area bystander crossed the start line first)."""
+    again around the moment the others say (Hintertux 0230: a start-area bystander crossed the start line first).
+    is_ref: the coach's own video, each gate's moment is where the coach paused with the racer at it — the crossing
+    is looked for within REF_WIN_S of that (beta IMG_5815: a racer higher up crossed the start line's 5 m extension
+    2.5 s early)."""
     marks = [dict(g) for g in gates if g]
     if not marks:
         return {"v": VERSION, "status": "nomatch"}
@@ -420,6 +550,9 @@ def run_video(path, gates, seg, *, track=None, ref_times=None, discipline="", lo
     a = analysis or analyse(path, start, 1.0 / fps, total, seg, G.marks_track(pull_marks, track), pull=True,
                             progress=progress, log=log)
     set_windows(a, marks, start)
+    if is_ref:
+        for mk in marks:
+            mk["win"] = [max(mk["win"][0], mk["t"] - REF_WIN_S), min(mk["win"][1], mk["t"] + REF_WIN_S)]
     res = G.passes(a, marks, start)
     by = {r["mark"]["label"]: r for r in res}
     if ref_times:

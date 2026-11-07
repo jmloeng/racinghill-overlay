@@ -109,6 +109,8 @@ def passes(a, marks, start):
             continue
         p = apply(Hs[k], feet[k - 1])
         jump[k] = np.hypot(feet[k][0] - p[0], feet[k][1] - p[1]) > JUMP * max(10, boxes[k][3] - boxes[k][1]) * 50 / fps
+        if not jump[k] and boxes[k - 1] is not None and _iou(boxes[k - 1], boxes[k], p, feet[k - 1]) < 0.12:
+            jump[k] = True      # a different person whose feet happen to be near (beta IMG_5815: a coach by the gate)
     res = []
     for mk in marks:
         i = int(round((mk["t"] - start) * fps))
@@ -134,6 +136,8 @@ def passes(a, marks, start):
         for u, v in zip(ks, ks[1:]):
             if v - u > MAX_GAP_S * fps:
                 continue
+            if v - u > 1 and any(jump[u + 1:v + 1]) and not _same_racer(feet, Hs, boxes, u, v, fps):
+                continue        # across a switch to someone else: not a hidden stretch of the same racer
             su, sv = s[u][0], s[v][0]
             if su == 0 or np.sign(su) == np.sign(sv):
                 continue
@@ -162,8 +166,8 @@ def passes(a, marks, start):
             lo = min((q for q in s if u - 3 <= q <= u), default=u)
             hi = max((q for q in s if v <= q <= v + 3), default=v)
             perp = min(abs(su - sv) / (v - u), abs(s[lo][0] - s[hi][0]) / max(1, hi - lo))
-            e_line = TAP_PX * (H / 1080) * np.hypot(1 + dist / pw, dist / pw)
-            e_foot = FOOT_PX * (H / 1080)
+            e_line = TAP_PX * (min(H, W) / 1080) * np.hypot(1 + dist / pw, dist / pw)
+            e_foot = FOOT_PX * (min(H, W) / 1080)
             err = max(0.5 / fps, float(np.hypot(e_line, e_foot)) / max(0.3, perp) / fps)
             if v - u > 1:
                 err = float(np.hypot(err, (v - u) / fps / 3))      # hidden stretch: the crossing is somewhere in it
@@ -192,6 +196,29 @@ def passes(a, marks, start):
     for gi, r in enumerate(res):
         r["n"] = gi + 1
     return res
+
+
+def _iou(b0, b1, p, f0):
+    """Overlap of box b1 with box b0 moved along with the camera (p = f0 carried into this frame)."""
+    dx, dy = p[0] - f0[0], p[1] - f0[1]
+    x0, y0, x1, y1 = b0[0] + dx, b0[1] + dy, b0[2] + dx, b0[3] + dy
+    iw = max(0.0, min(x1, b1[2]) - max(x0, b1[0]))
+    ih = max(0.0, min(y1, b1[3]) - max(y0, b1[1]))
+    inter = iw * ih
+    a0 = max(1.0, (x1 - x0) * (y1 - y0))
+    a1 = max(1.0, (b1[2] - b1[0]) * (b1[3] - b1[1]))
+    return inter / (a0 + a1 - inter)
+
+
+def _same_racer(feet, Hs, boxes, u, v, fps):
+    """After a hidden stretch u..v: is the foot point at v where the racer at u was heading?"""
+    if u < 1 or feet[u - 1] is None or boxes[u] is None:
+        return True
+    M = chain(Hs, u, v)
+    vel = np.subtract(feet[u], apply(Hs[u], feet[u - 1]))
+    pred = np.array(apply(M, feet[u])) + vel * (v - u)
+    h = max(10.0, boxes[u][3] - boxes[u][1])
+    return float(np.hypot(*(np.array(feet[v]) - pred))) < 0.8 * h * max(1.0, (v - u) * 25 / fps / 4)
 
 
 def summary(res):

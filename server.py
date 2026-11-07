@@ -277,7 +277,7 @@ def run_course_job(j):
                 if not any(gates):
                     res = {"status": "nomatch"}
                 else:
-                    res = COURSE.run_video(path, gates, seg, track=track(v), ref_times=None if vid == job["video_a"] else ref_times,
+                    res = COURSE.run_video(path, gates, seg, track=track(v), ref_times=None if vid == job["video_a"] else ref_times, is_ref=vid == job["video_a"],
                                            discipline=course.get("discipline") or "", log=log,
                                            progress=lambda p, b=base: progress(b + p * 90 / max(1, len(order))))
                 if vid == job["video_a"]:
