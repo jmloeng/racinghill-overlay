@@ -31,6 +31,9 @@ SIFT_EVERY = int(os.environ.get("RACELINE_SIFT_EVERY") or 2)  # keyframe match e
 RED = (29, 0, 232)    # BGR, Racinghill red (video 1 / the single video)
 BLUE = (255, 130, 0)  # BGR, the ghost's line in OVERLAY
 WHITE = (255, 255, 255)
+PULL = 12.0           # analyse(pull=True): score per frame width away from the marked track
+PULL_FAR = 0.2        # … and further than this from it, the whole picture is searched again (not just a crop)
+PULL_NEAR = 0.08     # … and a person this close to it may be picked even if far from the one followed so far
 
 
 def apply(H, p):
@@ -132,9 +135,11 @@ class CamTrack:
         return H, sure
 
 
-def analyse(path, t0, step_s, total, seg, track=None, progress=None, log=print):
+def analyse(path, t0, step_s, total, seg, track=None, progress=None, log=print, pull=False):
     """Frames at t0 + k*step_s (k < total). Returns dict fps, size, Hs (prev->cur, full px), feet, boxes, sure.
-    Frames before 0 / after the end: no racer, no camera motion (sure False)."""
+    Frames before 0 / after the end: no racer, no camera motion (sure False).
+    pull=True (gate timing): the track is where the racer surely is (the coach's marked gates) — it also steers the
+    choice while the racer is being followed, so a bystander picked by mistake is dropped again."""
     R = Reader(path)
     fps = 1.0 / step_s
     W = Hh = None
@@ -168,6 +173,12 @@ def analyse(path, t0, step_s, total, seg, track=None, progress=None, log=print):
         tp = track_pos(track, t)
         prior = (last[0] + vel[0], last[1] - (last_h or 100) * 0.5 + vel[1]) if (last is not None and recent) else None
         dets = detect(seg, frame, prior, last_h if recent else None)
+        drift = pull and prior is not None and tp is not None and np.hypot(prior[0] / W - tp[0], prior[1] / Hh - tp[1]) > PULL_FAR
+        if drift or (pull and prior is not None and not dets):
+            # far from where the racer surely is, or nobody where we looked (the guess of where the racer went was
+            # off — Hintertux 0225 lost the racer for 0.6 s before the finish): also look at the whole picture
+            # (the crop's people stay candidates — the whole-picture pass can miss a small, blurred racer)
+            dets = dets + detect(seg, frame, None, None)
         bg = skier_mask(g.shape)
         for (bx0, by0, bx1, by1), _, _, _ in dets:   # hide every person from the camera-motion estimate
             pad = 0.25 * (by1 - by0)
@@ -195,16 +206,29 @@ def analyse(path, t0, step_s, total, seg, track=None, progress=None, log=print):
             cands.append((d, ft, h, mv))
         hist.append((i, [(ft, h) for _, ft, h, _ in cands]))
         best, bscore = None, 1e9
+        lost = []                 # pull: candidates refused only for being far from the one followed
         for d, ft, h, mv in cands:
             score = -d[3]
             if mv is not None and mv < 0.15:
                 score += 4                                 # standing still: almost never the racer
+            near_tp = None
+            if pull and tp is not None:
+                near_tp = np.hypot(ft[0] / W - tp[0], ft[1] / Hh - tp[1])
+                score += PULL * near_tp
             if last is not None and recent:
                 exp = (last[0] + vel[0], last[1] + vel[1])
                 dist = np.hypot(ft[0] - exp[0], ft[1] - exp[1])
-                if dist > max(120, 2.5 * (last_h or h)):
+                # far from the one followed: only taken when it is where the racer surely is — or, while the one
+                # followed has drifted away from there (a bystander, seen on Hintertux 0225), anyone closer to it
+                if dist > max(120, 2.5 * (last_h or h)) and not (near_tp is not None and (near_tp < PULL_NEAR or (drift and near_tp < PULL_FAR))):
+                    if pull and not (mv is not None and mv < 0.15) and h >= 0.6 * (last_h or h):   # not someone smaller
+                        lost.append((score, (d, ft, h)))
                     continue
-                score += dist / max(h, 20)
+                if pull and last_h and h < 0.5 * last_h and dist > last_h:
+                    continue          # someone much smaller, well away: not the racer we follow (0225 finish)
+                score += min(dist / max(h, 20), 6)
+                if pull and last_h:
+                    score += 3 * abs(np.log(max(h, 5) / max(last_h, 5)))   # the racer doesn't halve in size in a moment
             else:
                 if tp is not None:
                     score += 3 * np.hypot(ft[0] / W - tp[0], ft[1] / Hh - tp[1])
@@ -212,6 +236,10 @@ def analyse(path, t0, step_s, total, seg, track=None, progress=None, log=print):
                     score += 1
             if score < bscore:
                 best, bscore = (d, ft, h), score
+        if best is None and lost:
+            # nobody where the one followed should be (it was a bystander who left, or the guess was off): take the
+            # best moving person now instead of waiting 0.6 s (Hintertux 0225 lost the racer at the finish gate)
+            best = min(lost, key=lambda x: x[0])[1]
         foot = None
         if best is not None:
             d, foot, h = best

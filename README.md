@@ -13,6 +13,8 @@ It uses [Ultralytics YOLO11s-seg](https://github.com/ultralytics/ultralytics) (A
 |---|---|
 | `overlay.py` | The overlay renderer: aligns run 2 to run 1 (SIFT + optical flow), cuts out the ghost, checks that both runs were filmed from the same spot, writes the MP4 with ffmpeg |
 | `raceline.py` | Race line: finds the skier's feet in every frame, follows the camera motion (keyframe SIFT + flow) and draws the line glued to the slope |
+| `gates.py` | Gate timing: passing time at each gate the coach marked (the feet crossing the line through the two pole feet, carried with the camera) and which gates were missed |
+| `course.py` | Course timing: start / split / finish tapped once on a reference video; finds the pole feet from one tap, finds the same gates in other videos filmed from the same spot, and times every run |
 | `seg.py` | Person segmentation with the ONNX model (640 px, plus an optional 320 px model for fast crops) |
 | `server.py` | Small HTTP worker (Google Cloud Run): takes a job, downloads the videos, renders, uploads the result as the logged-in user |
 | `Dockerfile` | Builds the container; stage 1 exports the YOLO11s-seg weights to ONNX at 640 and 320 px |

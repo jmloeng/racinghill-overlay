@@ -4,6 +4,14 @@ POST /render  { jobId, supabaseUrl, anonKey, cdnHost, referer }      Authorizati
   The job row (overlay_jobs, made by api/overlay.js as the user) says which videos, the time offset, the start,
   (stats.max_seconds) how long the overlay may be — 20 or 40 s — and (stats.lines) whether to draw both race lines.
   kind "raceline" (no video_b): one video with the racer's race line (raceline.py), saved as RACELINE_<name>.mp4.
+  kind "gates" (no video_b, beta v267): GATE TIMING — the coach's marked gates (stats.gates) → passing times + gate
+  judge (gates.py), saved as GATES_<name>.mp4 with the numbers burned in; the result also goes on the marked video
+  (videos.gates, as the user).
+  kind "course" (no video_b, beta v272): SET COURSE — the session's course (public.courses: start / split / finish
+  tapped once on the reference video = video_a) → pole feet on the reference video (courses.found), the same gates
+  found in every video of stats.videos and the racer's times through them → videos.course on each (course.py). No
+  video is made. Stops after COURSE_BUDGET_S (12 min: Cloud Run may stop an idle instance ~15 min after the last request); videos not reached stay "pending"
+  with "more": true and the app asks again.
   Reading it with the user's token checks the login and that the job is theirs (RLS). Answers 202 at once, then works
   in the background, one render at a time per instance:
     download both Bunny MP4s (1080p, else 720p) → overlay.render() → upload the MP4 to Storage (bucket Videos,
@@ -36,6 +44,8 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 from overlay import render, OverlayError, MAX_SECONDS, HERE
 from raceline import render_raceline
+from gates import render_gates
+import course as COURSE
 from seg import Segmenter
 
 PORT = int(os.environ.get("PORT", "8080"))
@@ -45,6 +55,7 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 REFERER_RE = re.compile(r"^https://[a-z0-9.-]+/$", re.I)
 CHUNK = 6 * 1024 * 1024
 GENERIC_ERROR = "Something went wrong while making the video. Please try again."
+COURSE_BUDGET_S = int(os.environ.get("COURSE_BUDGET_S") or 12 * 60)   # Cloud Run may stop an instance ~15 min after the last request
 
 
 def log(*a):
@@ -181,7 +192,134 @@ def segmenter():
     return _seg["s"]
 
 
+def run_course_job(j):
+    """kind "course": one reference video + the videos to time (stats.videos)."""
+    sb = Supa(j["supabaseUrl"], j["anonKey"], j["token"])
+    jid, job = j["jobId"], j["job"]
+    st = job.get("stats") if isinstance(job.get("stats"), dict) else {}
+    cid = st.get("course_id")
+    want = [v for v in (st.get("videos") or []) if isinstance(v, str) and UUID_RE.match(v)]
+    t0 = time.time()
+    tmp = tempfile.mkdtemp(prefix="co_")
+    done_ids = set()
+
+    def job_patch(body):
+        sb.patch(f"overlay_jobs?id=eq.{jid}", {**body, "updated_at": now()})
+
+    last = {"t": 0}
+
+    def progress(p):
+        if time.time() - last["t"] > 5:
+            last["t"] = time.time()
+            job_patch({"progress": int(max(1, min(99, p)))})
+
+    def vid_patch(vid, body):
+        s, b = sb.patch(f"videos?id=eq.{vid}", {"course": {"v": COURSE.VERSION, "course_id": cid, "job": jid, "at": now(), **body}})
+        if s not in (200, 204):
+            log("course result", vid, s, b[:300] if isinstance(b, bytes) else b)
+
+    def fail(msg):
+        log("course job failed", jid, msg)
+        job_patch({"status": "failed", "error": msg[:500]})
+        if cid:
+            sb.patch(f"courses?id=eq.{cid}", {"status": "failed", "error": msg[:300], "updated_at": now()})
+        for v in want:
+            if v not in done_ids:
+                vid_patch(v, {"status": "failed", "error": msg[:300]})
+
+    try:
+        if not cid or not UUID_RE.match(str(cid)):
+            return fail(GENERIC_ERROR)
+        job_patch({"status": "running", "progress": 1})
+        s, rows = sb.get(f"courses?id=eq.{cid}&select=id,session_id,ref_video_id,gates,discipline")
+        course = (rows or [None])[0]
+        if not course or course["session_id"] != job["session_id"] or course["ref_video_id"] != job["video_a"]:
+            return fail("The course is gone (deleted?).")
+        if (course.get("discipline") or "").strip().upper() == "SL":
+            return fail("Course timing works for GS, SG and DH for now - slalom comes later.")
+        ids = ",".join(dict.fromkeys([job["video_a"]] + want))
+        s, vrows = sb.get(f"videos?id=in.({ids})&select=id,session_id,athlete,bunny_id,bunny_status,track,file_name")
+        vrows = {r["id"]: r for r in (vrows or []) if r.get("session_id") == job["session_id"]}
+        ref = vrows.get(job["video_a"])
+        if not ref or not ref.get("bunny_id") or ref.get("bunny_status") != "ready":
+            return fail("The reference video is gone or still being processed.")
+        pr = os.path.join(tmp, "ref.mp4")
+        if not download_bunny(j["cdnHost"], ref["bunny_id"], j["referer"], pr):
+            return fail("Couldn't fetch the reference video from the stream service. Please try again later.")
+        refs = COURSE.ref_gates(pr, course.get("gates") or [], log=log)
+        found = [{k: v for k, v in r.items() if not k.startswith("_")} for r in refs]
+        sb.patch(f"courses?id=eq.{cid}", {"found": found, "status": "pending", "error": None, "updated_at": now()})
+        seg = segmenter()
+        track = lambda v: v.get("track") if isinstance(v.get("track"), dict) and v["track"].get("pts") else None  # noqa: E731
+        order = [job["video_a"]] + [v for v in want if v != job["video_a"]]
+        order = [v for v in order if v in want or v == job["video_a"]]
+        results = {}
+        ref_times = None          # the reference run's crossing times: a check for the other runs' times
+        for n, vid in enumerate(order):
+            if time.time() - t0 > COURSE_BUDGET_S:
+                break
+            v = vrows.get(vid)
+            base = 5 + 90 * n / max(1, len(order))
+            job_patch({"progress": int(base)})
+            if not v:
+                done_ids.add(vid)
+                continue
+            try:
+                if vid == job["video_a"]:
+                    path, gates = pr, [{k: x for k, x in r.items() if not k.startswith("_")} for r in refs]
+                else:
+                    path = os.path.join(tmp, "v.mp4")
+                    if not v.get("bunny_id") or v.get("bunny_status") != "ready" or not download_bunny(j["cdnHost"], v["bunny_id"], j["referer"], path):
+                        vid_patch(vid, {"status": "failed", "error": "Video not ready on the stream service."})
+                        done_ids.add(vid)
+                        continue
+                    gates, _, _ = COURSE.locate(path, refs, log=log)
+                if not any(gates):
+                    res = {"status": "nomatch"}
+                else:
+                    res = COURSE.run_video(path, gates, seg, track=track(v), ref_times=None if vid == job["video_a"] else ref_times,
+                                           discipline=course.get("discipline") or "", log=log,
+                                           progress=lambda p, b=base: progress(b + p * 90 / max(1, len(order))))
+                if vid == job["video_a"]:
+                    res["ref"] = True
+                    ref_times = {g["label"]: g["t"] for g in res.get("gates") or [] if g.get("t") is not None and g.get("status") in ("ok", "unsure")} or None
+                vid_patch(vid, res)
+                results[vid] = res.get("status")
+            except COURSE.OverlayError as e:
+                vid_patch(vid, {"status": "failed", "error": str(e)[:300]})
+                results[vid] = "failed"
+            except Exception:  # noqa: BLE001
+                log("course video error", vid, traceback.format_exc())
+                vid_patch(vid, {"status": "failed", "error": GENERIC_ERROR})
+                results[vid] = "failed"
+            finally:
+                done_ids.add(vid)
+                if vid != job["video_a"]:
+                    try:
+                        os.remove(os.path.join(tmp, "v.mp4"))
+                    except OSError:
+                        pass
+        left = [v for v in order if v not in done_ids]
+        for v in left:          # out of time: the app asks again for these
+            vid_patch(v, {"status": "pending", "more": True})
+        stats = {"course_id": cid, "videos": len(order), "done": sum(1 for x in results.values() if x == "done"),
+                 "nomatch": sum(1 for x in results.values() if x == "nomatch"), "failed": sum(1 for x in results.values() if x == "failed"),
+                 "left": left, "total_s": round(time.time() - t0, 1)}
+        sb.patch(f"courses?id=eq.{cid}", {"status": "done", "updated_at": now()})
+        job_patch({"status": "done", "progress": 100, "stats": stats})
+        log("course job done", jid, json.dumps(stats))
+    except COURSE.OverlayError as e:
+        fail(str(e))
+    except Exception:  # noqa: BLE001
+        log("course job error", jid, traceback.format_exc())
+        fail(GENERIC_ERROR)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def run_job(j):
+    if j["job"].get("kind") == "course":
+        return run_course_job(j)
     sb = Supa(j["supabaseUrl"], j["anonKey"], j["token"])
     jid = j["jobId"]
     t0 = time.time()
@@ -196,12 +334,17 @@ def run_job(j):
     def fail(msg):
         log("job failed", jid, msg)
         sb.patch(f"overlay_jobs?id=eq.{jid}", {"status": "failed", "error": msg[:500], "updated_at": now()})
+        if gate_job:
+            sb.patch(f"videos?id=eq.{j['job']['video_a']}", {"gates": {"v": 1, "marks": gate_marks, "job": jid, "status": "failed",
+                                                                         "error": msg[:300], "at": now()}})
 
+    job = j["job"]
+    gate_job = job.get("kind") == "gates"
+    gate_marks = (job.get("stats") or {}).get("gates") if gate_job and isinstance(job.get("stats"), dict) else None
     tmp = tempfile.mkdtemp(prefix="ov_")
     try:
-        job = j["job"]
-        single = job.get("kind") == "raceline"
-        what = "race line" if single else "overlay"
+        single = job.get("kind") in ("raceline", "gates")
+        what = "gate times" if gate_job else "race line" if single else "overlay"
         sb.patch(f"overlay_jobs?id=eq.{jid}", {"status": "running", "progress": 1, "updated_at": now()})
         ids = job["video_a"] if single else f"{job['video_a']},{job['video_b']}"
         s, rows = sb.get(f"videos?id=in.({ids})"
@@ -232,7 +375,11 @@ def run_job(j):
         uname = (md.get("full_name") or md.get("name") or (user.get("email") or "").split("@")[0] or "User")[:80]
         out = os.path.join(tmp, "overlay.mp4")
         track = lambda v: v.get("track") if isinstance(v.get("track"), dict) and v["track"].get("pts") else None  # noqa: E731
-        if single:
+        gate_result = None
+        if gate_job:
+            stats, gate_result = render_gates(pa, out, marks=gate_marks, seg=segmenter(), track=track(va),
+                                              name=va.get("athlete") or "", progress=lambda p: progress(8 + p * 82), log=log)
+        elif single:
             stats = render_raceline(pa, out, start=float(job["start_a"] or 0), seg=segmenter(), track=track(va),
                                     name=va.get("athlete") or "", max_seconds=job_seconds(job),
                                     progress=lambda p: progress(8 + p * 82), log=log)
@@ -241,11 +388,13 @@ def run_job(j):
                            track_a=track(va), track_b=track(vb), name_a=va.get("athlete") or "Video 1",
                            name_b=vb.get("athlete") or "Video 2", max_seconds=job_seconds(job),
                            progress=lambda p: progress(8 + p * 82), log=log, lines=job_lines(job))
-        stats["max_seconds"] = job_seconds(job)
+        if not gate_job:
+            stats["max_seconds"] = job_seconds(job)
 
         # upload as the user, then the videos row in A's session
         vid = str(uuid.uuid4())
-        fname = (f"RACELINE_{safe_name(va.get('athlete'), 'Video')}.mp4" if single else
+        fname = (f"GATES_{safe_name(va.get('athlete'), 'Video')}.mp4" if gate_job else
+                 f"RACELINE_{safe_name(va.get('athlete'), 'Video')}.mp4" if single else
                  f"OVERLAY_{safe_name(va.get('athlete'), 'Video1')}_vs_{safe_name(vb.get('athlete'), 'Video2')}.mp4")
         path = f"{va['session_id']}/{vid}_{fname}"
         progress(90, True)
@@ -270,6 +419,13 @@ def run_job(j):
             return fail(f"Saving the {what} video failed. Please try again.")
         stats.update(download_s=round(t_dl, 1), total_s=round(time.time() - t0, 1), quality=[qa] if single else [qa, qb],
                      mb=round(os.path.getsize(out) / 1e6, 1))
+        if gate_job:
+            # the result on the marked video (session overview, card line); marks kept for "mark again" / course map
+            gs, gb = sb.patch(f"videos?id=eq.{va['id']}", {"gates": {**gate_result, "marks": gate_marks, "job": jid, "status": "done",
+                                                                     "result_video_id": vid, "at": now()}})
+            if gs not in (200, 204):
+                log("gates result", gs, gb[:300] if isinstance(gb, bytes) else gb)
+            stats["result"] = {k: gate_result[k] for k in ("missed", "through", "unsure", "splits", "total", "ok")}
         sb.patch(f"overlay_jobs?id=eq.{jid}", {"status": "done", "progress": 100, "result_video_id": vid,
                                                 "stats": stats, "updated_at": now()})
         log("job done", jid, json.dumps(stats))

@@ -16,7 +16,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY --from=model /m/yolo11s-seg.onnx /m/yolo11s-seg-320.onnx /app/model/
-COPY overlay.py seg.py raceline.py server.py ./
+COPY overlay.py seg.py raceline.py gates.py course.py server.py ./
 RUN useradd -m worker && chown -R worker /app
 USER worker
 ENV PYTHONUNBUFFERED=1
