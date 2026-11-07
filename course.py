@@ -61,6 +61,7 @@ def plate(frames, t, tap, R=300):
     median. Returns (image the size of the frame — only the area around the tap is cleaned, used frame count)."""
     ref = frames[t]
     H, W = ref.shape[:2]
+    tap = _inside(tap, W, H)
     s = MATCH_WORK / max(H, W)
     gr = prep_gray(ref, s)
     fr = sift_feats(gr, skier_mask(gr.shape))
@@ -89,6 +90,11 @@ def plate(frames, t, tap, R=300):
     out = ref.copy()
     out[y0:y1, x0:x1] = med
     return out, len(stack) - 1
+
+
+def _inside(tap, W, H):
+    """A search point inside the picture (locate: a gate near the edge put it outside → empty crop, crash on beta 07.11)."""
+    return (min(max(float(tap[0]), 0.0), W - 1.0), min(max(float(tap[1]), 0.0), H - 1.0))
 
 
 def _x_at(fit, y):
@@ -150,6 +156,7 @@ def _feet_panel(frame, tap, _again=True):
     """frame (a clean plate is best), tap px anywhere on the gate → ([(xa, ya), (xb, yb)] left/right pole foot px,
     sure) or (None, False). GS-style gates: a panel between two poles."""
     H, W = frame.shape[:2]
+    tap = _inside(tap, W, H)
     sc = min(H, W) / 1080          # short side: an upright 1080x1920 phone video is "1080p" too
     R = int(230 * sc)
     x0, y0 = max(int(tap[0]) - R, 0), max(int(tap[1]) - int(1.3 * R), 0)
@@ -246,6 +253,7 @@ def _feet_poles(frame, tap):
     """No panel found (white panels, blue panels against blue sky, shadow on the snow): look for the gate's two poles
     directly — a pair of thin, nearly upright, similar lines with the tap between them (on the panel or at the feet)."""
     H, W = frame.shape[:2]
+    tap = _inside(tap, W, H)
     sc = min(H, W) / 1080
     R = int(230 * sc)
     x0, y0 = max(int(tap[0]) - R, 0), max(int(tap[1]) - int(1.3 * R), 0)
@@ -318,9 +326,21 @@ def find_feet(frame, tap):
     """frame (a clean plate is best), tap px anywhere on the gate → ([(xa, ya), (xb, yb)] left/right pole foot px,
     sure) or (None, False). The panel first (coloured GS panels), else the pair of poles around the tap."""
     feet, sure = _feet_panel(frame, tap)
-    if feet is not None:
+    if feet is not None and _holds_tap(feet, tap):
         return feet, sure
-    return _feet_poles(frame, tap)
+    # no panel, or the panel of a gate beside the one tapped (the server found the next gate's panel on beta
+    # IMG_5815 where this PC found none — the video decodes a little differently there): the pole pair around the tap
+    f2, s2 = _feet_poles(frame, tap)
+    if f2 is not None and (feet is None or _holds_tap(f2, tap)):
+        return f2, s2
+    return feet, (sure and feet is not None and _holds_tap(feet, tap))
+
+
+def _holds_tap(feet, tap, slack=0.2):
+    """Is the tap (on the panel or between the poles) within the gate's width, give or take slack × the pole gap?"""
+    (lx, _), (rx, _) = feet
+    g = max(1.0, rx - lx)
+    return lx - slack * g <= tap[0] <= rx + slack * g
 
 
 def feet_at(path, t, tap, frames=None):

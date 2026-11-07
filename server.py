@@ -192,6 +192,16 @@ def segmenter():
     return _seg["s"]
 
 
+def token_left_s(token):
+    """Seconds until the user's Supabase login (JWT) expires; a lot when it can't be read."""
+    try:
+        part = token.split(".")[1]
+        exp = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))["exp"]
+        return float(exp) - time.time()
+    except Exception:
+        return 24 * 3600.0
+
+
 def run_course_job(j):
     """kind "course": one reference video + the videos to time (stats.videos)."""
     sb = Supa(j["supabaseUrl"], j["anonKey"], j["token"])
@@ -200,6 +210,9 @@ def run_course_job(j):
     cid = st.get("course_id")
     want = [v for v in (st.get("videos") or []) if isinstance(v, str) and UUID_RE.match(v)]
     t0 = time.time()
+    # stop while the user's login still works: every result is saved with it (beta 07.11: it ran out 12 min in and
+    # the last two videos' times were lost) — the rest are marked pending + more and the app asks again
+    budget = min(COURSE_BUDGET_S, max(60, token_left_s(j["token"]) - 300))   # one video can take ~4 min
     tmp = tempfile.mkdtemp(prefix="co_")
     done_ids = set()
 
@@ -256,7 +269,7 @@ def run_course_job(j):
         results = {}
         ref_times = None          # the reference run's crossing times: a check for the other runs' times
         for n, vid in enumerate(order):
-            if time.time() - t0 > COURSE_BUDGET_S:
+            if time.time() - t0 > budget:
                 break
             v = vrows.get(vid)
             base = 5 + 90 * n / max(1, len(order))
