@@ -20,6 +20,11 @@ POST /render  { jobId, supabaseUrl, anonKey, cdnHost, referer }      Authorizati
   to that session (locked team) gets a clear error. No secrets of its own; Supabase projects and Bunny CDN hosts
   must be on the allow lists (env ALLOWED_SUPABASE, ALLOWED_CDN), like the track worker (worker/server.js).
   Bunny ingest of the result is left to the app (the player asks /api/bunny "status" when the video is opened).
+POST /bib  { videoId, supabaseUrl, anonKey, cdnHost, referer }   Authorization: Bearer <the user's token>   (beta v281)
+  BIB READING: reads the video as the user (RLS), takes the Bunny MP4, finds the racer and asks the app's own
+  /api/bib (Claude reads the start number on a sheet of crops — bib.py) up to three times; an answer counts when it is
+  on the session's start list (any 1–3 digit / V-number when the session has no list). Saves videos.bib_read as the
+  user. The worker holds no AI key: the app's server does the asking (referer must be on ALLOWED_APP).
 GET /health
 
 Local test without login or upload:  python overlay.py … (see overlay.py), or
@@ -46,6 +51,7 @@ from overlay import render, OverlayError, MAX_SECONDS, HERE
 from raceline import render_raceline
 from gates import render_gates
 import course as COURSE
+import bib as BIB
 from seg import Segmenter
 
 PORT = int(os.environ.get("PORT", "8080"))
@@ -55,6 +61,8 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 REFERER_RE = re.compile(r"^https://[a-z0-9.-]+/$", re.I)
 CHUNK = 6 * 1024 * 1024
 GENERIC_ERROR = "Something went wrong while making the video. Please try again."
+ALLOWED_APP = [s.strip() for s in (os.environ.get("ALLOWED_APP") or "https://racinghill.com/,https://www.racinghill.com/,https://beta.racinghill.com/").split(",") if s.strip()]
+BIB_RE = re.compile(r"^V?[1-9][0-9]{0,2}$")
 COURSE_BUDGET_S = int(os.environ.get("COURSE_BUDGET_S") or 12 * 60)   # Cloud Run may stop an instance ~15 min after the last request
 
 
@@ -330,7 +338,64 @@ def run_course_job(j):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def run_bib_job(j):
+    """BIB READING (beta v281): see bib.py. Never raises; the result (or the failure) goes on videos.bib_read."""
+    sb = Supa(j["supabaseUrl"], j["anonKey"], j["token"])
+    vid = j["videoId"]
+    t0 = time.time()
+    tmp = tempfile.mkdtemp(prefix="bib_")
+
+    def save(body):
+        s, b = sb.patch(f"videos?id=eq.{vid}", {"bib_read": {"v": 1, "at": now(), **body}})
+        if s not in (200, 204):
+            log("bib save", vid, s, b[:300] if isinstance(b, bytes) else b)
+
+    try:
+        s, rows = sb.get(f"videos?id=eq.{vid}&select=id,session_id,bunny_id,bunny_status")
+        v = (rows or [None])[0]
+        if not v or not v.get("bunny_id") or v.get("bunny_status") != "ready":
+            return save({"status": "failed", "error": "not ready"})
+        s, lst = sb.get(f"session_start_lists?session_id=eq.{v['session_id']}&select=bib&limit=1000")
+        bibs = {r["bib"] for r in (lst or []) if isinstance(r.get("bib"), int)}
+        path = os.path.join(tmp, "v.mp4")
+        if not download_bunny(j["cdnHost"], v["bunny_id"], j["referer"], path):
+            return save({"status": "failed", "error": "no stream file"})
+        cands, samples = BIB.racer_crops(path, segmenter(), log=log)
+        sets = BIB.tries(cands, samples)
+        if not sets:
+            return save({"status": "none", "tries": 0, "list": bool(bibs), "reason": "no racer found", "secs": round(time.time() - t0, 1)})
+        seen = []
+        for n, (name, picks) in enumerate(sets, 1):
+            img = base64.b64encode(BIB.sheet(picks)).decode()
+            st, body, _ = http("POST", j["referer"] + "api/bib", {"Authorization": f"Bearer {j['token']}"},
+                               {"videoId": vid, "try": n, "set": name, "image": img}, timeout=90)
+            if st != 200:
+                log("bib api", vid, st, body[:200])
+                if n == 1:
+                    return save({"status": "failed", "error": f"api {st}"})
+                break
+            r = json.loads(body or b"{}")
+            ans = str(r.get("bib") or "").strip().upper() or None
+            seen.append({"try": n, "set": name, "answer": ans})
+            if not ans or not BIB_RE.match(ans):
+                continue
+            # with a start list: the number must be on it (forerunners' V-numbers are never on a list — kept as they are)
+            if bibs and not ans.startswith("V") and int(ans) not in bibs:
+                continue
+            log("bib found", vid, ans, "try", n, round(time.time() - t0, 1), "s")
+            return save({"status": "found", "bib": ans, "try": n, "set": name, "list": bool(bibs), "seen": seen,
+                         "by": r.get("model"), "secs": round(time.time() - t0, 1)})
+        save({"status": "none", "tries": len(seen), "list": bool(bibs), "seen": seen, "secs": round(time.time() - t0, 1)})
+    except Exception:  # noqa: BLE001
+        log("bib job error", vid, traceback.format_exc())
+        save({"status": "failed", "error": "worker error"})
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def run_job(j):
+    if j.get("kind") == "bib":
+        return run_bib_job(j)
     if j["job"].get("kind") == "course":
         return run_course_job(j)
     sb = Supa(j["supabaseUrl"], j["anonKey"], j["token"])
@@ -485,6 +550,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path == "/bib":
+            return self.post_bib()
         if self.path != "/render":
             return self.send(404, {"error": "not found"})
         try:
@@ -513,6 +580,33 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             log("bad request", traceback.format_exc())
             self.send(400, {"error": "bad request"})
+
+
+def _post_bib(self):
+    try:
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 10000:
+            return self.send(413, {"error": "too big"})
+        body = json.loads(self.rfile.read(n) or b"{}")
+        token = re.sub(r"^Bearer\s+", "", self.headers.get("Authorization") or "", flags=re.I)
+        vid, sbu, anon, cdn, ref = body.get("videoId"), body.get("supabaseUrl"), body.get("anonKey"), body.get("cdnHost"), body.get("referer")
+        if not token or not isinstance(vid, str) or not UUID_RE.match(vid) or not isinstance(anon, str):
+            return self.send(400, {"error": "bad request"})
+        if sbu not in ALLOWED_SUPABASE or cdn not in ALLOWED_CDN or ref not in ALLOWED_APP:
+            return self.send(403, {"error": "not allowed"})
+        s, rows = Supa(sbu, anon, token).get(f"videos?id=eq.{vid}&select=id")
+        if s == 401:
+            return self.send(401, {"error": "not logged in"})
+        if not rows:
+            return self.send(404, {"error": "video not found"})
+        jobs.put({"kind": "bib", "videoId": vid, "supabaseUrl": sbu, "anonKey": anon, "cdnHost": cdn, "referer": ref, "token": token})
+        self.send(202, {"queued": True, "position": jobs.qsize() + state["running"]})
+    except Exception:  # noqa: BLE001
+        log("bad bib request", traceback.format_exc())
+        self.send(400, {"error": "bad request"})
+
+
+Handler.post_bib = _post_bib
 
 
 def main():
